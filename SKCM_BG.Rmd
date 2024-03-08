@@ -1,0 +1,1812 @@
+---
+title: "SCKM_BG"
+author: "Daria O. Shavronskaia"
+date: "2024-02-23"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# PART 0
+
+#### From the [cbioportal website](www.cbioportal.org) download data on a cohort of melanoma patients — click the download button. The cohort is located along the path Skin → Melanoma → Cutaneous Melanoma → Skin Cutaneous Melanoma (TCGA, Firehouse Legacy). The patient's ID is 12 characters long, the sample has 16 characters
+
+```{r}
+# Set working directory
+setwd("/Users/dariashavronskaia/TCGA_SKCM")
+```
+
+#### Upload all the libraries
+```{r message=FALSE, warning=FALSE, include=TRUE, paged.print=TRUE}
+Sys.setenv(XML_CONFIG="/usr/bin/xml2-config")
+# Package names
+packages_1 <- c("dplyr", "tidyverse", "pheatmap", "stats", "gplots", "dendextend", "gtsummary", "colorRamp2", "survival", "survminer", "readxl", "RColorBrewer", "rpart", "forcats", "factoextra", "glmnet", "caret", "randomForest", "webshot", "htmlwidgets", "webshot", "pROC")
+packages_2 <- c("GO.db", "HDO.db", "ComplexHeatmap", "ConsensusClusterPlus", "clusterProfiler", "edgeR", "biomaRt", "XML", "limma", "org.Hs.eg.db")
+
+# Install packages not yet installed
+installed_packages <- packages_1 %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages_1[!installed_packages])
+}
+# Install BiocManager not yet installed
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Install packages not yet installed
+installed_packages <- packages_2 %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  BiocManager::install(packages_2[!installed_packages])
+}
+
+# Packages loading
+invisible(lapply(packages_1, library, character.only = TRUE))
+invisible(lapply(packages_2, library, character.only = TRUE))
+```
+
+#### Upload sample infromation and modify the dataframe
+
+```{r}
+samples <- read.delim("~/TCGA_SKCM/skcm_tcga/data_clinical_sample.txt", skip = 4)
+df_s <- unique(samples)
+
+# Filtering and transforming data
+df_s <- df_s %>%
+  distinct(PATIENT_ID, .keep_all = TRUE)  %>%
+  dplyr::select(PATIENT_ID, SAMPLE_ID, DAYS_TO_COLLECTION, SAMPLE_TYPE, TMB_NONSYNONYMOUS) %>%
+  mutate(METASTASIS = case_when(
+    SAMPLE_TYPE == "Primary" ~ 0, 
+    SAMPLE_TYPE == "Metastasis" ~ 1
+  )) %>%
+  mutate(log10TMB = log10(TMB_NONSYNONYMOUS)) %>%
+  dplyr::select(-SAMPLE_TYPE, -TMB_NONSYNONYMOUS) %>%
+  mutate_all(~gsub("\\[Not Available\\]", NA, .)) %>%
+  mutate(DAYS_TO_COLLECTION = as.numeric(DAYS_TO_COLLECTION),
+         METASTASIS = as.numeric(METASTASIS),
+         log10TMB = as.numeric(log10TMB)
+  )
+head(df_s)
+
+rm(samples)
+```
+#### Upload patient information and modify the dataframe
+
+```{r}
+patients <- read.delim("~/TCGA_SKCM/skcm_tcga/data_clinical_patient.txt", skip=4)
+df_p <- unique(patients)
+
+# Filtering and transforming data
+df_p <- df_p %>%
+  distinct(PATIENT_ID, .keep_all = TRUE) %>%
+  dplyr::select(PATIENT_ID, SEX, HEIGHT, WEIGHT, RACE, TUMOR_STATUS, CLARK_LEVEL_AT_DIAGNOSIS, OS_STATUS, OS_MONTHS, DFS_STATUS, DFS_MONTHS, AGE) %>%
+   mutate(MALE = case_when(
+    SEX == "Male" ~ 1, 
+    SEX == "Female" ~ 0
+  )) %>%
+  mutate(CLARK_LEVEL = case_when(
+    CLARK_LEVEL_AT_DIAGNOSIS == "I" ~ 1, 
+    CLARK_LEVEL_AT_DIAGNOSIS == "II" ~ 2, 
+    CLARK_LEVEL_AT_DIAGNOSIS == "III" ~ 3, 
+    CLARK_LEVEL_AT_DIAGNOSIS == "IV" ~ 4, 
+  )) %>%
+  mutate(DECEASED = case_when(
+    OS_STATUS == "1:DECEASED" ~ 1,
+    OS_STATUS == "0:LIVING" ~ 0
+  )) %>%
+  mutate(RECURRED_PROGRESSED = case_when(
+    DFS_STATUS == "1:Recurred/Progressed" ~ 1,
+    DFS_STATUS == "0:DiseaseFree" ~ 0
+  ))%>%
+  mutate(TUMOR_FREE = case_when(
+    TUMOR_STATUS == "TUMOR FREE" ~ 1,
+    TUMOR_STATUS == "WITH TUMOR" ~ 0
+  ))%>%
+  dplyr::select(-SEX, -CLARK_LEVEL_AT_DIAGNOSIS,-OS_STATUS, -DFS_STATUS, -TUMOR_STATUS) %>%
+  mutate_all(~gsub("\\[Not Available\\]", NA, .)) %>%
+  mutate(HEIGHT = as.numeric(HEIGHT),
+         WEIGHT = as.numeric(WEIGHT),
+         OS_MONTHS = as.numeric(OS_MONTHS),
+         AGE = as.numeric(AGE),
+         DFS_MONTHS = as.numeric(DFS_MONTHS), 
+         MALE = as.numeric(MALE), 
+         CLARK_LEVEL = as.numeric(CLARK_LEVEL), 
+         DECEASED = as.numeric(DECEASED),
+         RECURRED_PROGRESSED = as.numeric(RECURRED_PROGRESSED),
+         TUMOR_FREE = as.numeric(TUMOR_FREE)
+  ) 
+         
+head(df_p)
+rm(patients)
+```
+# TASK 1
+#### Reproduce the classification into 3 expression types: MITF-low, Keratin, Immune from the article [Akbani et al. 2015](doi:10.1016/j.cell.2015.05.044), describing this dataset. At that time, ~330 samples were available. 
+#### We have two approaches to consider: 
+#### * Reapply the clustering procedure from the article to include all samples. 
+#### * Utilize the classification of the 329 samples as a basis to classify additional samples.
+
+# PART 1. 329 samples
+#### Upload information about classification of the samples and modify the dataframe
+
+```{r}
+original_data <- read_excel("~/TCGA_SKCM/original_data/mmc2.xlsx", sheet = 4, skip = 1)
+
+# Filtering and transforming data
+original_data <- original_data %>%
+  dplyr::rename('SAMPLE_ID' = 'Name') %>%
+  dplyr::select(SAMPLE_ID, MUTATIONSUBTYPES, REGIONAL_VS_PRIMARY, `RNASEQ-CLUSTER_CONSENHIER`, MethTypes.201408, PIGMENT.SCORE, NECROSIS, LYMPHOCYTE.SCORE, `UV-RATE`) %>%
+  dplyr::rename('RNASEQ_CLUSTER_CONSENHIER' = 'RNASEQ-CLUSTER_CONSENHIER') %>%
+  mutate(TISSUE_ORIGIN = case_when(
+    REGIONAL_VS_PRIMARY == "Primary_Disease" ~ 'Primary',
+    REGIONAL_VS_PRIMARY == "Regional_Skin_or_Soft_Tissue" ~ 'Regional_non_LN',
+    REGIONAL_VS_PRIMARY == "Distant_Metastases" ~ 'Distant_Metastases',
+    REGIONAL_VS_PRIMARY == "Regional_Lymph_Node" ~ 'Regional_LN'
+  )) %>%
+  dplyr::rename('UV_RATE' = 'UV-RATE') %>%
+  dplyr::select(-REGIONAL_VS_PRIMARY) %>%
+  mutate_all(~gsub("\\[Not Available\\]", NA, .)) %>%
+  mutate(
+    PIGMENT.SCORE = as.numeric(PIGMENT.SCORE),
+    NECROSIS = as.numeric(NECROSIS), 
+    LYMPHOCYTE.SCORE = as.numeric(LYMPHOCYTE.SCORE),
+    UV_RATE = as.numeric(UV_RATE)
+  ) %>%
+  dplyr::filter(RNASEQ_CLUSTER_CONSENHIER != '-')
+
+subset_indices1 <- original_data$RNASEQ_CLUSTER_CONSENHIER == "-"
+original_data$RNASEQ_CLUSTER_CONSENHIER[subset_indices1] <- NA
+subset_indices2 <- original_data$MUTATIONSUBTYPES == "-"
+original_data$MUTATIONSUBTYPES[subset_indices2] <- NA
+head(original_data)
+```
+#### Join the uploaded and modified dataframes into one by keys
+
+```{r}
+# Merging df_s with df_p on 'PATIENT_ID' to combine related data from both dataframes
+df_ps <-
+  left_join(df_s, df_p, by = "PATIENT_ID") %>%
+  # Filtering out specific samples based on their 'SAMPLE_ID' because there are not into mat 
+  filter(SAMPLE_ID != "TCGA-GN-A269-01") %>%
+  filter(SAMPLE_ID != "TCGA-GN-A261-06")
+
+# Merging the previously obtained dataframe (df_ps) with another dataframe (original_data) on 'SAMPLE_ID'
+df_meta <- 
+  left_join(original_data, df_ps, by = "SAMPLE_ID")
+
+# Modify LYMPHOCYTE SCORE according to the article
+df_meta <- df_meta %>%
+  mutate(IMMUNE.SCORE = case_when(
+    is.na(LYMPHOCYTE.SCORE) ~ as.character(NA),
+    LYMPHOCYTE.SCORE %in% c("1", "2") ~ "1-2",
+    LYMPHOCYTE.SCORE %in% c("3", "4") ~ "3-4",
+    TRUE ~ "5-6"))
+
+```
+
+#### EDA
+#### Histogram for AGE
+
+```{r}
+df_meta %>%
+  ggplot(mapping = aes(x = AGE)) + 
+  geom_histogram() 
+summary(df_meta$AGE)
+```
+#### Histogram for WEIGHT
+
+```{r}
+df_meta %>%
+  ggplot(mapping = aes(WEIGHT)) + 
+  geom_histogram() 
+
+summary(df_meta$WEIGHT)
+```
+#### Histogram for HEIGHT
+
+```{r}
+df_meta %>%
+  ggplot(mapping = aes(x = HEIGHT)) +
+  geom_histogram()
+summary(df_meta$HEIGHT)
+```
+#### Histogram for log10TMB
+
+```{r}
+df_meta %>%
+  ggplot(mapping = aes(x = log10TMB)) + 
+  geom_histogram() 
+
+summary(df_meta$log10TMB)
+```
+
+#### Upload RNA-seq data, log2-transform it, then center by median and scale by MAD
+
+```{r warning=FALSE}
+# Read and preprocess the data
+df_t <- 
+  read_delim("~/TCGA_SKCM/skcm_tcga/data_mrna_seq_v2_rsem.txt") %>%
+  dplyr::select(-Hugo_Symbol) %>%
+  dplyr::select(Entrez_Gene_Id, df_meta$SAMPLE_ID) %>%
+  distinct(Entrez_Gene_Id, .keep_all = TRUE)
+
+# Transpose and set row and column names
+mat <- t(df_t[-1])
+colnames(mat) <- df_t$Entrez_Gene_Id
+rownames(mat) <- colnames(df_t)[-1]
+
+# Log Transformation
+mat <- log2(mat + 1)
+
+# Feature selection based on variability
+features <- 
+  apply(mat, 2, mad) %>%
+  sort(decreasing = T) %>%
+  .[1:1500] %>%
+  names()
+
+# Normalize the data
+mat <- apply(mat, 2, function(x) (x - median(x))/mad(x))
+
+# Reduce the matrix to selected features
+mat <- mat[, features]
+
+```
+
+#### In the research paper, the authors initially utilized average linkage clustering; however, the resulting dendrogram did not match the expected outcomes depicted in the publication. Consequently, to align the dendrogram appearance with the one presented in the paper, complete linkage clustering was employed for the analysis of samples. In the research process, after exploring various clustering methods, Ward's D2 method was ultimately applied for the hierarchical clustering of genes.
+
+```{r}
+# Calculate Euclidean distance between samples and perform hierarchical clustering using complete linkage
+# The result is converted into a dendrogram for visualization
+smpl.dend <- 
+  dist(mat, method = "euclidean") %>%
+  hclust(method = "complete") %>%
+  as.dendrogram()
+
+# Calculate Euclidean distance between genes (transpose of the matrix) and perform hierarchical clustering using Ward's D2 method
+# This is also converted into a dendrogram
+gene.dend <- 
+  dist(t(mat), method = "euclidean") %>%
+  hclust(method = "ward.D2") %>%
+  as.dendrogram()
+
+# Define the number of clusters for splitting samples and genes in the heatmap
+k.smpl <- 3
+k.gene <- 3
+
+# Define a color palette for the clusters
+color <- c("#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00")
+
+# Apply color to the branches of the sample dendrogram based on the specified number of clusters
+smpl.dend <- color_branches(smpl.dend, k = k.smpl, col = color[1:k.smpl])
+gene.dend <- color_branches(gene.dend, k = k.gene, col = color[1:k.gene])
+
+# Generate a heatmap of the transposed matrix with customizations
+Heatmap(t(mat), 
+        show_row_names = F, show_column_names = F,
+        name = "Gene expression",
+        row_title = "G%s", column_title = "S%s",
+        show_heatmap_legend = FALSE,
+        cluster_rows = gene.dend,
+        cluster_columns = smpl.dend,
+        row_split = k.gene,
+        column_split = k.smpl)
+```
+
+```{r}
+# Clusters genes based on hierarchical clustering dendrogram with specified number of clusters (k.gene)
+# It then assigns each gene to a cluster (G1, G2, G3) based on its position in the dendrogram
+gene.grp <- cutree(gene.dend, k = k.gene)
+gene.grp <- case_when(gene.grp == 1 ~ "G1",
+                 gene.grp == 2 ~ "G2",
+                 gene.grp == 3 ~ "G3")
+
+# Performs GO enrichment analysis for each gene cluster using the 'compareCluster' function
+# It aims to identify significant biological processes (BP) associated with each gene cluster
+ck.bp <- compareCluster(geneCluster = list("G1" = colnames(mat)[gene.grp == "G1"],
+                                           "G2" = colnames(mat)[gene.grp == "G2"],
+                                           "G3" = colnames(mat)[gene.grp == "G3"]),
+                        fun = "enrichGO", OrgDb = "org.Hs.eg.db", ont = "BP",
+                        universe = colnames(mat),
+                        pvalueCutoff = 0.05, qvalueCutoff = 1)
+
+# Selects GO terms from the enrichment results and formats them for visualization
+# It then filters for the top 5 GO terms by adjusted p-value within each cluster for concise display
+GO <-
+  ck.bp@compareClusterResult%>%
+  as_tibble() %>%
+  group_by(Cluster) %>%
+  slice_min(order_by = p.adjust, n = 5)
+
+text_list = list(
+    text1 = filter(GO, Cluster == "G1")$Description,
+    text2 = filter(GO, Cluster == "G2")$Description,
+    text3 = filter(GO, Cluster == "G3")$Description
+)
+```
+
+```{r}
+# Define categorical variables
+mutation_subtype_colors <- c("BRAF_Hotspot_Mutants" = "orange", "Triple_WT" = "purple", "RAS_Hotspot_Mutants" = "blue", "NF1_Any_Mutants" = "green")
+tissue_origin_colors <- c("Regional_non_LN" = "yellow", "Distant_Metastases" = "brown", "Regional_LN" = "orange", "Primary" = "purple")
+
+# Creating the HeatmapAnnotation
+smpl.ha <- HeatmapAnnotation(
+  `PIGMENTATION.SCORE` = df_meta$PIGMENT.SCORE,
+  `IMMUNE.SCORE` = df_meta$IMMUNE.SCORE,
+  `MUTATION SUBTYPES` = df_meta$MUTATIONSUBTYPES,
+  `TISSUE ORIGIN` = df_meta$TISSUE_ORIGIN,
+  col = list(
+    `MUTATION SUBTYPES` = mutation_subtype_colors,
+    `TISSUE ORIGIN` = tissue_origin_colors
+  )
+)
+
+# Prepares a custom palette and an empty annotation space for displaying selected GO terms next to the heatmap
+my_palette <- brewer.pal(n = 5, name = "Set1")
+gene.ha <- rowAnnotation(foo = anno_empty(border = FALSE, width = max_text_width(unlist(text_list)) + unit(4, "mm")))
+
+# Constructs and configures the heatmap, incorporating both sample and gene annotations
+p <- Heatmap(t(mat), 
+        show_row_names = F, show_column_names = F,
+        name = "Gene expression",
+        top_annotation = smpl.ha,
+        right_annotation = gene.ha,
+        row_title = 'G%s', column_title = 'S%s',
+        row_dend_width = unit(10, "mm"),
+        column_dend_height = unit(10, "mm"),
+        show_heatmap_legend = T,
+        cluster_rows = gene.dend,
+        cluster_columns = smpl.dend,
+        row_split = k.gene,
+        column_split = k.smpl)
+
+# Saves the heatmap to an image file, decorating the gene annotation space with GO terms for each cluster
+png("heatmap_BG_1.png", width = 15, height = 6, units = "in", res = 300)
+draw(p)
+for(i in 1:k.gene) {
+    decorate_annotation("foo", slice = i, {
+        grid.rect(x = 0, width = unit(2, "mm"), 
+                  gp = gpar(fill = color[i], col = NA, fontsize = 10), just = "left")
+        grid.text(paste(text_list[[i]], collapse = "\n"), 
+                  x = unit(4, "mm"), just = "left")
+    })
+}
+dev.off()
+```
+#### Gene and sample clustering 
+
+```{r}
+
+# Perform hierarchical clustering on samples and cut the dendrogram to form 'k.smpl' clusters
+smpl.grp <- cutree(smpl.dend, k = k.smpl)
+
+# Visualize the sample clusters
+fviz_cluster(list(data = mat, cluster = smpl.grp),
+             palette = "Set1",
+             geom = "point",
+             ellipse.type = "convex",
+             show.clust.cent = FALSE,
+             main = "Sample clusters",
+             ggtheme = theme_minimal())
+
+# Perform hierarchical clustering on genes and cut the dendrogram to form 'k.gene' clusters
+gene.grp <- cutree(gene.dend, k = k.gene)
+
+# Visualize the gene clusters
+fviz_cluster(list(data = t(mat), cluster = gene.grp),
+             palette = "Set1",
+             geom = "point",
+             ellipse.type = "convex",
+             show.clust.cent = FALSE,
+             main = "Gene clusters",
+             ggtheme = theme_minimal())
+```
+
+#### Kruskal-Wallis Test is used for comparing two or more independent samples of equal or different sample sizes
+
+```{r}
+# Convert the matrix 'mat' to a data frame
+mat_df <- as.data.frame(mat)
+
+# Append cluster labels as a new column
+mat_df$labels <- as.factor(smpl.grp)
+
+# Ensure that labels are factors with appropriate levels
+mat_df$labels <- factor(mat_df$labels, levels = c("1", "2", "3"))
+
+# Select genes
+genes <- colnames(mat_df)
+
+# Perform Kruskal-Wallis test for each gene
+res <- sapply(genes, function(x) {
+  model <- kruskal.test(mat_df[[x]] ~ mat_df$labels)
+  p <- model$p.value
+  return(p)
+})
+
+# Set names for the result vector
+names(res) <- genes
+
+# Adjust p-values for multiple testing using Benjamini-Hochberg procedure
+adjusted_p <- p.adjust(res, method = "BH")
+
+# Define a significance threshold
+threshold <- 0.001
+
+# Identify significant genes for each label
+significant_genes <- list()
+for (label in levels(mat_df$labels)) {
+  sig_genes <- names(adjusted_p)[adjusted_p < threshold & mat_df$labels == label]
+  significant_genes[[paste("Label", label, sep = "_")]] <- sig_genes
+}
+
+```
+#### Retrieve detailed gene information from the Ensembl database for a set of genes identified as significant in a previous analysis
+#### Group 1
+```{r}
+# Querying ensembl for gene information
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Retrieving gene symbols
+symbols_1 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[1]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+# Preparing to query ensembl
+values_to_query <- symbols_1$ENTREZID
+
+# Expand attributes to include functional information
+genes_info_1 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query, 
+                      mart = ensembl)
+
+# Check the first few rows to confirm it worked as expected
+head(genes_info_1)
+```
+#### Gene Ontology (GO) enrichment analysis using the enrichGO function from the clusterProfiler package, followed by visualization of the enrichment results with a dot plot
+
+```{r}
+# Performing GO enrichment analysis
+ego1 <- enrichGO(gene = symbols_1$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.01) 
+
+# Open a PNG graphics device, specifying the file name and dimensions
+png("~/TCGA_SKCM/dot_plot_1.png", width = 1200, height = 800)
+
+# Generate the dot plot
+clusterProfiler::dotplot(ego1, showCategory = 20) 
+
+# Close the device to save the plot to the file
+dev.off()
+```
+
+#### Group 2
+
+```{r}
+symbols_2 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[2]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query_2 <- symbols_2$ENTREZID
+
+genes_info_2 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query_2, 
+                      mart = ensembl)
+
+head(genes_info_2)
+```
+
+```{r}
+ego2 <- enrichGO(gene = symbols_2$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.005) 
+
+png("~/TCGA_SKCM/dot_plot_2.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego2, showCategory = 20)
+
+dev.off()
+```
+#### Group 3
+
+```{r}
+symbols_3 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[3]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query_3 <- symbols_3$ENTREZID
+
+genes_info_3 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query_3, 
+                      mart = ensembl)
+
+head(genes_info_3)
+```
+
+```{r}
+ego3 <- enrichGO(gene = symbols_3$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.05) 
+
+png("~/TCGA_SKCM/dot_plot_3.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego3, showCategory = 20) 
+
+dev.off()
+```
+
+#### Given the results from gene information, heatmap, and Gene Ontology (GO) term analyses, the clusters have been categorized based on their presumed biological functions as follows: "1" = "keratin", "2" = "immune", "3" = "MIFT-low"
+
+```{r}
+# Append cluster labels as a new column
+mat_df$labels <- as.factor(smpl.grp)
+
+# Prepare labels for replacement 
+label_replacements <- c("1" = "keratin", "2" = "immune", "3" = "MIFT-low")
+
+# Replace numeric labels with descriptive labels
+mat_df$labels <- factor(mat_df$labels, levels = names(label_replacements), labels = label_replacements)
+```
+
+```{r}
+# Merge two dataframes 
+merged_df <- merge(x = mat_df, y = df_meta, by.x = "row.names", by.y = "SAMPLE_ID", all.x = TRUE)
+
+# Rename the first column to "row.names"
+colnames(merged_df)[1] <- "SAMPLE_ID"
+```
+
+```{r}
+# See how many clusters are the same
+matching_counts <- table(merged_df$RNASEQ_CLUSTER_CONSENHIER == merged_df$labels)
+matching_counts
+```
+#### The analysis results did not meet expectations
+
+#### Survival analysis
+```{r}
+# Assign biological interpretations to clusters
+smpl.grp <- cutree(smpl.dend, k = k.smpl)
+smpl.grp <- case_when(smpl.grp == 1 ~ "keratin",
+                 smpl.grp == 2 ~ "immune",
+                 smpl.grp == 3 ~ "MFTI-low")
+
+# Prepare the data frame for analysis
+df <- df_meta %>%
+  mutate(CLUSTER = as.factor(smpl.grp)) %>%
+  distinct(PATIENT_ID, .keep_all = T) %>%
+  filter(!is.na(DECEASED))
+  
+surv_obj <- Surv(time = df$OS_MONTHS/12, event = df$DECEASED)
+
+# Fit Kaplan-Meier survival curve
+km_fit <- survfit(surv_obj ~ df$CLUSTER)
+
+ggsurvplot(km_fit,
+           conf.int = F,  # Show confidence interval
+           risk.table = F,  # Add a table of the number of subjects at risk at each time point
+           xlab = "Time (years)",  # Customize X-axis label
+           ylab = "Cumulative Survival Rate",  # Customize Y-axis label
+           ggtheme = theme_minimal(), 
+           data = df)  # Use a minimal theme for the plot
+```
+
+# PART 2. 469 samples
+#### Make the same operations but for all samples
+
+```{r}
+# Merging df_s with df_p on 'PATIENT_ID' to combine related data from both dataframes
+df_meta_2 <-
+  left_join(df_s, df_p, by = "PATIENT_ID") %>%
+  # Filtering out specific samples based on their 'SAMPLE_ID' because there are not into mat 
+  dplyr::filter(SAMPLE_ID != "TCGA-GN-A269-01") %>%
+  dplyr::filter(SAMPLE_ID != "TCGA-GN-A261-06")
+
+```
+
+#### Upload data that is then log2 transformed, median-centred RNA-seq and MAD-scaled
+
+```{r warning=FALSE}
+# Read and preprocess the data
+df_t <- 
+  read_delim("~/TCGA_SKCM/skcm_tcga/data_mrna_seq_v2_rsem.txt") %>%
+  dplyr::select(-Hugo_Symbol) %>%
+  dplyr::select(Entrez_Gene_Id, df_meta_2$SAMPLE_ID) %>%
+  distinct(Entrez_Gene_Id, .keep_all = TRUE)
+
+# Transpose and set row and column names
+mat <- t(df_t[-1])
+colnames(mat) <- df_t$Entrez_Gene_Id
+rownames(mat) <- colnames(df_t)[-1]
+
+# Log Transformation
+mat <- log2(mat + 1)
+
+# Feature selection based on variability
+features <- 
+  apply(mat, 2, mad) %>%
+  sort(decreasing = T) %>%
+  .[1:1500] %>%
+  names()
+
+# Normalize the data
+mat <- apply(mat, 2, function(x) (x - median(x))/mad(x))
+
+# Reduce the matrix to selected features
+mat <- mat[, features]
+
+```
+#### In the research paper, the authors initially utilized average linkage clustering; however, the resulting dendrogram did not match the expected outcomes depicted in the publication. Consequently, to align the dendrogram appearance with the one presented in the paper, complete linkage clustering was employed for the analysis of samples. In the research process, after exploring various clustering methods, Ward's D2 method was ultimately applied for the hierarchical clustering of genes.
+
+```{r}
+# Calculate Euclidean distance between samples and perform hierarchical clustering using complete linkage
+# The result is converted into a dendrogram for visualization
+smpl.dend <- 
+  dist(mat, method = "euclidean") %>%
+  hclust(method = "complete") %>%
+  as.dendrogram()
+
+# Calculate Euclidean distance between genes (transpose of the matrix) and perform hierarchical clustering using Ward's D2 method
+# This is also converted into a dendrogram
+gene.dend <- 
+  dist(t(mat), method = "euclidean") %>%
+  hclust(method = "ward.D2") %>%
+  as.dendrogram()
+
+# Define the number of clusters for splitting samples and genes in the heatmap
+k.smpl <- 3
+k.gene <- 3
+
+# Define a color palette for the clusters
+color <- c("#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00")
+
+# Apply color to the branches of the sample dendrogram based on the specified number of clusters
+smpl.dend <- color_branches(smpl.dend, k = k.smpl, col = color[1:k.smpl])
+gene.dend <- color_branches(gene.dend, k = k.gene, col = color[1:k.gene])
+
+# Generate a heatmap of the transposed matrix with customizations
+Heatmap(t(mat), 
+        show_row_names = F, show_column_names = F,
+        name = "Gene expression",
+        row_title = "G%s", column_title = "S%s",
+        show_heatmap_legend = FALSE,
+        cluster_rows = gene.dend,
+        cluster_columns = smpl.dend,
+        row_split = k.gene,
+        column_split = k.smpl)
+```
+
+```{r}
+# Clusters genes based on hierarchical clustering dendrogram with specified number of clusters (k.gene)
+# It then assigns each gene to a cluster (G1, G2, G3) based on its position in the dendrogram
+gene.grp <- cutree(gene.dend, k = k.gene)
+gene.grp <- case_when(gene.grp == 1 ~ "G1",
+                 gene.grp == 2 ~ "G2",
+                 gene.grp == 3 ~ "G3")
+
+# Performs GO enrichment analysis for each gene cluster using the 'compareCluster' function
+# It aims to identify significant biological processes (BP) associated with each gene cluster
+ck.bp <- compareCluster(geneCluster = list("G1" = colnames(mat)[gene.grp == "G1"],
+                                           "G2" = colnames(mat)[gene.grp == "G2"],
+                                           "G3" = colnames(mat)[gene.grp == "G3"]),
+                        fun = "enrichGO", OrgDb = "org.Hs.eg.db", ont = "BP",
+                        universe = colnames(mat),
+                        pvalueCutoff = 0.05, qvalueCutoff = 1)
+
+# Selects GO terms from the enrichment results and formats them for visualization
+# It then filters for the top 5 GO terms by adjusted p-value within each cluster for concise display
+GO <-
+  ck.bp@compareClusterResult%>%
+  as_tibble() %>%
+  group_by(Cluster) %>%
+  slice_min(order_by = p.adjust, n = 5)
+
+text_list = list(
+    text1 = filter(GO, Cluster == "G1")$Description,
+    text2 = filter(GO, Cluster == "G2")$Description,
+    text3 = filter(GO, Cluster == "G3")$Description
+)
+```
+
+```{r}
+# Prepares a custom palette and an empty annotation space for displaying selected GO terms next to the heatmap
+my_palette <- brewer.pal(n = 5, name = "Set1")
+gene.ha <- rowAnnotation(foo = anno_empty(border = FALSE, width = max_text_width(unlist(text_list)) + unit(4, "mm")))
+
+# Constructs and configures the heatmap, incorporating both sample and gene annotations
+p <- Heatmap(t(mat), 
+        show_row_names = F, show_column_names = F,
+        name = "Gene expression",
+        right_annotation = gene.ha,
+        row_title = 'G%s', column_title = 'S%s',
+        row_dend_width = unit(10, "mm"),
+        column_dend_height = unit(10, "mm"),
+        show_heatmap_legend = T,
+        cluster_rows = gene.dend,
+        cluster_columns = smpl.dend,
+        row_split = k.gene,
+        column_split = k.smpl)
+
+# Saves the heatmap to an image file, decorating the gene annotation space with GO terms for each cluster
+png("heatmap_BG_2.png", width = 15, height = 6, units = "in", res = 300)
+draw(p)
+for(i in 1:k.gene) {
+    decorate_annotation("foo", slice = i, {
+        grid.rect(x = 0, width = unit(2, "mm"), 
+                  gp = gpar(fill = color[i], col = NA, fontsize = 10), just = "left")
+        grid.text(paste(text_list[[i]], collapse = "\n"), 
+                  x = unit(4, "mm"), just = "left")
+    })
+}
+dev.off()
+```
+#### Gene and sample clustering 
+
+```{r}
+
+# Perform hierarchical clustering on samples and cut the dendrogram to form 'k.smpl' clusters
+smpl.grp <- cutree(smpl.dend, k = k.smpl)
+
+# Visualize the sample clusters
+fviz_cluster(list(data = mat, cluster = smpl.grp),
+             palette = "Set1",
+             geom = "point",
+             ellipse.type = "convex",
+             show.clust.cent = FALSE,
+             main = "Sample clusters",
+             ggtheme = theme_minimal())
+
+# Perform hierarchical clustering on genes and cut the dendrogram to form 'k.gene' clusters
+gene.grp <- cutree(gene.dend, k = k.gene)
+
+# Visualize the gene clusters
+fviz_cluster(list(data = t(mat), cluster = gene.grp),
+             palette = "Set1",
+             geom = "point",
+             ellipse.type = "convex",
+             show.clust.cent = FALSE,
+             main = "Gene clusters",
+             ggtheme = theme_minimal())
+```
+#### Kruskal-Wallis Test is used for comparing two or more independent samples of equal or different sample sizes
+
+```{r}
+# Convert the matrix 'mat' to a data frame
+mat_df <- as.data.frame(mat)
+
+# Append cluster labels as a new column
+mat_df$labels <- as.factor(smpl.grp)
+
+# Ensure that labels are factors with appropriate levels
+mat_df$labels <- factor(mat_df$labels, levels = c("1", "2", "3"))
+
+# Select genes
+genes <- colnames(mat_df)
+
+# Perform Kruskal-Wallis test for each gene
+res <- sapply(genes, function(x) {
+  model <- kruskal.test(mat_df[[x]] ~ mat_df$labels)
+  p <- model$p.value
+  return(p)
+})
+
+# Set names for the result vector
+names(res) <- genes
+
+# Adjust p-values for multiple testing using Benjamini-Hochberg procedure
+adjusted_p <- p.adjust(res, method = "BH")
+
+# Define a significance threshold
+threshold <- 0.001
+
+# Identify significant genes for each label
+significant_genes <- list()
+for (label in levels(mat_df$labels)) {
+  sig_genes <- names(adjusted_p)[adjusted_p < threshold & mat_df$labels == label]
+  significant_genes[[paste("Label", label, sep = "_")]] <- sig_genes
+}
+
+```
+
+#### Retrieve detailed gene information from the Ensembl database for a set of genes identified as significant in a previous analysis
+#### Group 1
+```{r}
+# Querying ensembl for gene information
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Retrieving gene symbols
+symbols_1 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[1]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+# Preparing to query ensembl
+values_to_query <- symbols_1$ENTREZID
+
+# Expand attributes to include functional information
+genes_info_1 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query, 
+                      mart = ensembl)
+
+# Check the first few rows to confirm it worked as expected
+head(genes_info_1)
+```
+#### Gene Ontology (GO) enrichment analysis using the enrichGO function from the clusterProfiler package, followed by visualization of the enrichment results with a dot plot
+
+```{r}
+# Performing GO enrichment analysis
+ego1 <- enrichGO(gene = symbols_1$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.005) 
+
+# Open a PNG graphics device, specifying the file name and dimensions
+png("~/TCGA_SKCM/dot_plot_4.png", width = 1200, height = 800)
+
+# Generate the dot plot
+clusterProfiler::dotplot(ego1, showCategory = 20) 
+
+# Close the device to save the plot to the file
+dev.off()
+```
+
+#### Group 2
+
+```{r}
+symbols_2 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[2]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query_2 <- symbols_2$ENTREZID
+
+genes_info_2 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query_2, 
+                      mart = ensembl)
+
+head(genes_info_2)
+```
+
+```{r}
+ego2 <- enrichGO(gene = symbols_2$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.05) 
+
+png("~/TCGA_SKCM/dot_plot_5.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego2, showCategory = 20) 
+
+dev.off()
+```
+#### Group 3
+
+```{r}
+symbols_3 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[3]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query_3 <- symbols_3$ENTREZID
+
+genes_info_3 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query_3, 
+                      mart = ensembl)
+head(genes_info_3)
+```
+
+```{r}
+ego3 <- enrichGO(gene = symbols_3$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.05) 
+
+png("~/TCGA_SKCM/dot_plot_6.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego3, showCategory = 20)
+
+dev.off()
+```
+
+#### Given the results from gene information, heatmap, Gene Ontology (GO) term analyses, the clusters have been categorized based on their presumed biological functions as follows: "1" = "keratin", "2" = "MIFT-low", "3" = "immune"
+
+```{r}
+# Append cluster labels as a new column
+mat_df$labels <- as.factor(smpl.grp)
+
+# Prepare labels for replacement 
+label_replacements <- c("1" = "keratin", "2" = "MIFT-low", "3" = "immune")
+
+# Replace numeric labels with descriptive labels
+mat_df$labels <- factor(mat_df$labels, levels = names(label_replacements), labels = label_replacements)
+```
+
+```{r}
+# Merge two dataframes 
+merged_df <- merge(x = mat_df, y = df_meta, by.x = "row.names", by.y = "SAMPLE_ID", all.x = TRUE)
+
+# Rename the first column to "row.names"
+colnames(merged_df)[1] <- "SAMPLE_ID"
+```
+
+```{r}
+# See how many clusters are the same
+matching_counts <- table(merged_df$RNASEQ_CLUSTER_CONSENHIER == merged_df$labels)
+matching_counts
+```
+#### The analysis results did not meet expectations
+
+#### Survival analysis
+
+```{r}
+# Assign biological interpretations to clusters
+smpl.grp <- cutree(smpl.dend, k = k.smpl)
+smpl.grp <- case_when(smpl.grp == 1 ~ "keratin",
+                 smpl.grp == 2 ~ "MIFT-low",
+                 smpl.grp == 3 ~ "immune")
+
+# Prepare the data frame for analysis
+df <- df_meta_2 %>%
+  mutate(CLUSTER = as.factor(smpl.grp)) %>%
+  distinct(PATIENT_ID, .keep_all = T) %>%
+  filter(!is.na(DECEASED))
+  
+surv_obj <- Surv(time = df$OS_MONTHS/12, event = df$DECEASED)
+
+# Fit Kaplan-Meier survival curve
+km_fit <- survfit(surv_obj ~ df$CLUSTER)
+
+ggsurvplot(km_fit,
+           conf.int = F,  # Show confidence interval
+           risk.table = F,  # Add a table of the number of subjects at risk at each time point
+           xlab = "Time (years)",  # Customize X-axis label
+           ylab = "Cumulative Survival Rate",  # Customize Y-axis label
+           ggtheme = theme_minimal(), 
+           data = df)  # Use a minimal theme for the plot
+```
+
+#### I obtained almost the same Kaplan-Meier curves for the different sample clusters with higher survival of immune cluster
+
+
+# PART 3
+#### Let's predict
+
+```{r}
+class <- df_meta$RNASEQ_CLUSTER_CONSENHIER
+```
+```{r warning=FALSE}
+# Read and preprocess the data
+df_t <- 
+  read_delim("~/TCGA_SKCM/skcm_tcga/data_mrna_seq_v2_rsem.txt") %>%
+  dplyr::select(-Hugo_Symbol) %>%
+  dplyr::select(Entrez_Gene_Id, df_meta$SAMPLE_ID) %>%
+  distinct(Entrez_Gene_Id, .keep_all = TRUE)
+
+# Transpose and set row and column names
+mat <- t(df_t[-1])
+colnames(mat) <- df_t$Entrez_Gene_Id
+rownames(mat) <- colnames(df_t)[-1]
+
+# Log Transformation
+mat <- log2(mat + 1)
+
+# Feature selection based on variability
+features <- 
+  apply(mat, 2, mad) %>%
+  sort(decreasing = T) %>%
+  .[1:1500] %>%
+  names()
+
+# Normalize the data
+mat <- apply(mat, 2, function(x) (x - median(x))/mad(x))
+
+# Reduce the matrix to selected features
+mat <- mat[, features]
+
+```
+```{r}
+# Read and preprocess the data
+df_t_2 <- 
+  read_delim("~/TCGA_SKCM/skcm_tcga/data_mrna_seq_v2_rsem.txt") %>%
+  dplyr::select(-Hugo_Symbol) %>%
+  dplyr::select(Entrez_Gene_Id, df_meta_2$SAMPLE_ID) %>%
+  distinct(Entrez_Gene_Id, .keep_all = TRUE)
+
+# Transpose and set row and column names
+mat_2 <- t(df_t_2[-1])
+colnames(mat_2) <- df_t_2$Entrez_Gene_Id
+rownames(mat_2) <- colnames(df_t_2)[-1]
+
+# Log Transformation
+mat_2 <- log2(mat_2 + 1)
+
+# Feature selection based on variability
+features <- 
+  apply(mat_2, 2, mad) %>%
+  sort(decreasing = T) %>%
+  .[1:1500] %>%
+  names()
+
+# Normalize the data
+mat_2 <- apply(mat_2, 2, function(x) (x - median(x))/mad(x))
+
+# Reduce the matrix to selected features
+mat_2 <- mat_2[, features]
+
+```
+
+#### LASSO for feature selection
+```{r}
+# Ensure reproducibility
+set.seed(123)
+# Performe cross-validated logistic regression for multinomial outcomes 
+cv_fit <- cv.glmnet(as.matrix(mat), as.factor(class), family = "multinomial", alpha = 1)
+plot(cv_fit)
+```
+
+```{r}
+best_lambda <- cv_fit$lambda.min
+lasso_model <- glmnet(as.matrix(mat), as.factor(class), family = "multinomial", alpha = 1, lambda = best_lambda)
+
+# Extract non-zero coefficients (features) from LASSO Model
+coef_matrix <- coef(lasso_model, s = best_lambda)
+non_zero_features <- unique(unlist(lapply(coef_matrix[-1], function(x) {
+  # Extract feature names for non-zero coefficients, excluding intercept
+  features <- rownames(x)[x@i[x@i != 0]]
+  if (length(features) > 0) return(features) else return(NULL)
+})))
+
+# Subset to include only selected features
+mat_final <- mat[, non_zero_features]
+common_features <- non_zero_features[non_zero_features %in% colnames(mat_2)]
+
+# Subset to include only the common features
+mat_2_final <- mat_2[, common_features]
+mat_final <- mat[, common_features]
+rna_data <- data.frame(mat_final)
+```
+
+#### Selected features - 49 genes
+
+```{r}
+dim(mat_final)
+```
+
+```{r}
+dim(mat_2_final)
+```
+
+#### Preform logistic regression
+
+```{r}
+# Split the data into training and testing sets
+set.seed(123)
+train_indices <- sample(nrow(rna_data), 0.7 * nrow(rna_data))
+train_data <- rna_data[train_indices, ]
+test_data <- rna_data[-train_indices, ]
+
+train_labels <- class[train_indices]
+test_labels <- class[-train_indices]
+```
+
+```{r}
+# Train the model using labels from df_meta
+multinom_model <- cv.glmnet(as.matrix(train_data), as.factor(train_labels), family = "multinomial", alpha = 1)
+
+# Predict on the test dataset and calculate accuracy
+predictions <- predict(multinom_model, newx = as.matrix(test_data), type = "class")
+
+confusionMatrix(factor(predictions), factor(test_labels))
+```
+
+```{r}
+# Perform prediction on the new data matrix
+predictions_new <- predict(multinom_model, newx = as.matrix(mat_2_final), type = "class")
+
+# Align predictions with the sample identifiers
+predictions_new_df <- data.frame(prediction = as.character(predictions_new), row.names = rownames(mat_2_final))
+
+predictions_new_df <- tibble::rownames_to_column(predictions_new_df, var = "SAMPLE_ID")
+
+# Print or inspect the aligned predictions
+head(predictions_new_df)
+```
+
+```{r}
+# Merge predicted classes with original metadata
+predictions_with_class <- predictions_new_df %>%
+  left_join(df_meta %>% dplyr::select(SAMPLE_ID, RNASEQ_CLUSTER_CONSENHIER, PATIENT_ID, OS_MONTHS, DECEASED), by = "SAMPLE_ID")
+
+
+# Calculate matching counts
+matching_counts <- table(predictions_with_class$RNASEQ_CLUSTER_CONSENHIER == predictions_with_class$prediction)
+matching_counts
+```
+
+#### Build KM curves
+```{r}
+
+# Prepare the data frame for analysis
+df <- predictions_with_class %>%
+  distinct(PATIENT_ID, .keep_all = T) %>%
+  filter(!is.na(DECEASED)) %>%
+  mutate(CLUSTER = prediction)
+  
+surv_obj <- Surv(time = df$OS_MONTHS/12, event = df$DECEASED)
+
+# Fit Kaplan-Meier survival curve
+km_fit <- survfit(surv_obj ~ df$CLUSTER)
+
+ggsurvplot(km_fit,
+           conf.int = F,  # Show confidence interval
+           risk.table = F,  # Add a table of the number of subjects at risk at each time point
+           xlab = "Time (years)",  # Customize X-axis label
+           ylab = "Cumulative Survival Rate",  # Customize Y-axis label
+           ggtheme = theme_minimal(), 
+           data = df)  # Use a minimal theme for the plot
+```
+
+#### I am pleased with the outcomes, as the immune cluster indicates improved survival rates, and the majority of the samples were accurately predicted
+
+#### Preform random forest
+
+```{r}
+# Train the Random Forest model
+rf_model <- randomForest(x = train_data, y = as.factor(train_labels), ntree = 500)
+
+# Predict on the test dataset
+predictions_test_rf <- predict(rf_model, newdata = test_data)
+
+# Calculate accuracy or confusion matrix for test predictions
+confusionMatrix(predictions_test_rf, factor(test_labels))
+```
+
+
+```{r}
+# Delete X from the names
+colnames(mat_2_final) <- paste0("X", colnames(mat_2_final))
+
+# Predict
+predictions_new_rf_common <- predict(rf_model, newdata = mat_2_final)
+
+# Align predictions with sample identifiers, assuming row names of mat_2 represent them
+predictions_new_df_rf_common <- data.frame(prediction = as.character(predictions_new_rf_common), row.names = rownames(mat_2_final))
+predictions_new_df_rf_common <- tibble::rownames_to_column(predictions_new_df_rf_common, var = "SAMPLE_ID")
+```
+
+```{r}
+predictions_with_class_rf <- predictions_new_df_rf_common %>%
+  left_join(df_meta %>% dplyr::select(SAMPLE_ID,RNASEQ_CLUSTER_CONSENHIER, OS_MONTHS, DECEASED), by = "SAMPLE_ID")
+
+matching_counts_rf <- table(predictions_with_class_rf$RNASEQ_CLUSTER_CONSENHIER == predictions_with_class_rf$prediction)
+matching_counts_rf
+```
+```{r}
+# Prepare the data frame for analysis
+df <- predictions_with_class %>%
+  distinct(PATIENT_ID, .keep_all = T) %>%
+  filter(!is.na(DECEASED)) %>%
+  mutate(CLUSTER = prediction)
+  
+surv_obj <- Surv(time = df$OS_MONTHS/12, event = df$DECEASED)
+
+# Fit Kaplan-Meier survival curve
+km_fit <- survfit(surv_obj ~ df$CLUSTER)
+
+ggsurvplot(km_fit,
+           conf.int = F,  # Show confidence interval
+           risk.table = F,  # Add a table of the number of subjects at risk at each time point
+           xlab = "Time (years)",  # Customize X-axis label
+           ylab = "Cumulative Survival Rate",  # Customize Y-axis label
+           ggtheme = theme_minimal(), 
+           data = df)  # Use a minimal theme for the plot
+```
+
+#### I am pleased with the outcomes, as the immune cluster indicates improved survival rates, and the majority of the samples were accurately predicted
+
+
+# TASK 2
+#### Reproduce the classification described in the article by [Jönsson et al. 2010](https://doi.org/10.1158/1078-0432.CCR-09-2509) into 4 classes: Pigmentation, Proliferative, Normal-like, High-immune response. 
+#### They performed unsupervised hierarchical clustering of global gene expression data from stage IV melanomas in 57 patients
+
+# PART 1
+
+#### Upload all the necessary data
+```{r}
+samples <- read.delim("~/TCGA_SKCM/skcm_tcga/data_clinical_sample.txt", skip = 4)
+df_s <- unique(samples)
+df_s <- df_s %>%
+  distinct(PATIENT_ID, .keep_all = TRUE)  %>%
+  dplyr::select(PATIENT_ID, SAMPLE_ID, DAYS_TO_COLLECTION, SAMPLE_TYPE, TMB_NONSYNONYMOUS) %>%
+  mutate(METASTASIS = case_when(
+    SAMPLE_TYPE == "Primary" ~ 0, 
+    SAMPLE_TYPE == "Metastasis" ~ 1
+  )) %>%
+  mutate(log10TMB = log10(TMB_NONSYNONYMOUS)) %>%
+  dplyr::select(-SAMPLE_TYPE, -TMB_NONSYNONYMOUS) %>%
+  mutate_all(~gsub("\\[Not Available\\]", NA, .)) %>%
+  mutate(DAYS_TO_COLLECTION = as.numeric(DAYS_TO_COLLECTION),
+         METASTASIS = as.numeric(METASTASIS),
+         log10TMB = as.numeric(log10TMB)
+  )
+head(df_s)
+
+rm(samples)
+```
+
+```{r}
+patients <- read.delim("~/TCGA_SKCM/skcm_tcga/data_clinical_patient.txt", skip=4)
+df_p <- unique(patients)
+df_p <- df_p %>%
+  distinct(PATIENT_ID, .keep_all = TRUE) %>%
+  dplyr::select(PATIENT_ID, SEX, HEIGHT, WEIGHT, RACE, TUMOR_STATUS, CLARK_LEVEL_AT_DIAGNOSIS, AJCC_PATHOLOGIC_TUMOR_STAGE, OS_STATUS, OS_MONTHS, DFS_STATUS, DFS_MONTHS, AGE) %>%
+   mutate(MALE = case_when(
+    SEX == "Male" ~ 1, 
+    SEX == "Female" ~ 0
+  )) %>%
+  mutate(CLARK_LEVEL = case_when(
+    CLARK_LEVEL_AT_DIAGNOSIS == "I" ~ 1, 
+    CLARK_LEVEL_AT_DIAGNOSIS == "II" ~ 2, 
+    CLARK_LEVEL_AT_DIAGNOSIS == "III" ~ 3, 
+    CLARK_LEVEL_AT_DIAGNOSIS == "IV" ~ 4, 
+  )) %>%
+  mutate(DECEASED = case_when(
+    OS_STATUS == "1:DECEASED" ~ 1,
+    OS_STATUS == "0:LIVING" ~ 0
+  )) %>%
+  mutate(RECURRED_PROGRESSED = case_when(
+    DFS_STATUS == "1:Recurred/Progressed" ~ 1,
+    DFS_STATUS == "0:DiseaseFree" ~ 0
+  ))%>%
+  mutate(TUMOR_FREE = case_when(
+    TUMOR_STATUS == "TUMOR FREE" ~ 1,
+    TUMOR_STATUS == "WITH TUMOR" ~ 0
+  ))%>%
+  dplyr::select(-SEX, -CLARK_LEVEL_AT_DIAGNOSIS,-OS_STATUS, -DFS_STATUS, -TUMOR_STATUS) %>%
+  mutate_all(~gsub("\\[Not Available\\]", NA, .)) %>%
+  mutate(HEIGHT = as.numeric(HEIGHT),
+         WEIGHT = as.numeric(WEIGHT),
+         OS_MONTHS = as.numeric(OS_MONTHS),
+         AGE = as.numeric(AGE),
+         DFS_MONTHS = as.numeric(DFS_MONTHS), 
+         MALE = as.numeric(MALE), 
+         CLARK_LEVEL = as.numeric(CLARK_LEVEL), 
+         DECEASED = as.numeric(DECEASED),
+         RECURRED_PROGRESSED = as.numeric(RECURRED_PROGRESSED),
+         TUMOR_FREE = as.numeric(TUMOR_FREE)
+  )
+         
+head(df_p)
+rm(patients)
+```
+
+#### Merge dataframes and choose only IV Stage
+
+```{r}
+df_meta <-
+  left_join(df_s, df_p, by = "PATIENT_ID") %>%
+  filter(SAMPLE_ID != "TCGA-GN-A261-06") %>%
+  filter(SAMPLE_ID != "TCGA-GN-A269-01") %>%
+  filter(AJCC_PATHOLOGIC_TUMOR_STAGE %in% c("Stage IV"))
+
+df_meta_copy <- df_meta 
+
+rm(df_s, df_p)
+
+dim(df_meta)
+
+```
+
+#### We have only 23 patients
+
+#### Upload RNAseq data that are then log2-transformed and mean-centred
+```{r warning=FALSE}
+# Read and preprocess the data
+df_t <- 
+  read_delim("~/TCGA_SKCM/skcm_tcga/data_mrna_seq_v2_rsem.txt") %>%
+  dplyr::select(-Hugo_Symbol) %>%
+  dplyr::select(Entrez_Gene_Id, df_meta$SAMPLE_ID) %>%
+  distinct(Entrez_Gene_Id, .keep_all = TRUE)
+
+# Transpose and set row and column names
+mat <- t(df_t[-1])
+colnames(mat) <- df_t$Entrez_Gene_Id
+rownames(mat) <- colnames(df_t)[-1]
+
+# Log Transformation
+mat <- log2(mat + 1)
+
+# Feature selection based on variability
+features <- 
+  apply(mat, 2, mad) %>%
+  sort(decreasing = T) %>%
+  .[1:3000] %>%
+  names()
+
+# Normalize the data
+mat <- apply(mat, 2, function(x) (x - mean(x)))
+
+# Reduce the matrix to selected features
+mat <- mat[, features]
+
+```
+#### Hierarchical clustering of samples and genes based on their expression profiles using Pearson correlation and average linkage for samples
+
+```{r}
+smpl.dend <- t(mat) %>%
+  cor(method = "pearson") %>%
+  {as.dist(1 - .)} %>%
+  {hclust(., method = "average")} %>%
+  as.dendrogram()
+plot(smpl.dend)
+
+gene.dend <- mat %>%
+  cor(method = "pearson") %>%
+  {as.dist(1 - .)} %>%
+  {hclust(., method = "ward.D2")} %>%
+  as.dendrogram()
+
+k.smpl <- 4
+k.gene <- 4
+
+color <- c("#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00")
+
+smpl.dend <- color_branches(smpl.dend, k = k.smpl, col = color[1:k.smpl])
+gene.dend <- color_branches(gene.dend, k = k.gene, col = color[1:k.gene])
+```
+#### GO terms assign
+
+```{r}
+gene.grp <- cutree(gene.dend, k = k.gene)
+gene.grp <- case_when(gene.grp == 1 ~ "G1",
+                 gene.grp == 2 ~ "G2",
+                 gene.grp == 3 ~ "G3", 
+                 gene.grp == 4 ~ "G4")
+
+ck.bp <- compareCluster(geneCluster = list("G1" = colnames(mat)[gene.grp == "G1"],
+                                           "G2" = colnames(mat)[gene.grp == "G2"],
+                                           "G3" = colnames(mat)[gene.grp == "G3"],
+                                           "G4" = colnames(mat)[gene.grp == "G4"]),
+                        fun = "enrichGO", OrgDb = "org.Hs.eg.db", ont = "BP",
+                        universe = colnames(mat),
+                        pvalueCutoff = 0.01, qvalueCutoff = 1)
+
+GO <- ck.bp@compareClusterResult %>%
+  as_tibble() %>%
+  group_by(Cluster) %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 5)
+
+text_list = list(
+    text1 = filter(GO, Cluster == "G1")$Description,
+    text2 = filter(GO, Cluster == "G2")$Description,
+    text3 = filter(GO, Cluster == "G3")$Description,
+    text4 = filter(GO, Cluster == "G4")$Description
+)
+
+```
+
+#### Heatmap building 
+
+```{r warning=FALSE}
+ht_opt$message = FALSE
+
+my_palette <- brewer.pal(n = 5, name = "Set1")
+gene.ha <- rowAnnotation(foo = anno_empty(border = FALSE, width = max_text_width(unlist(text_list)) + unit(4, "mm")))
+
+p <- Heatmap(t(mat), 
+        show_row_names = F, show_column_names = F,
+        name = "Gene expression",
+        right_annotation = gene.ha,
+        row_title = 'G%s', column_title = 'S%s',
+        row_dend_width = unit(10, "mm"),
+        column_dend_height = unit(10, "mm"),
+        show_heatmap_legend = FALSE,
+        cluster_rows = gene.dend,
+        cluster_columns = smpl.dend,
+        row_split = k.gene,
+        column_split = k.smpl)
+
+png("heatmap_BG_3.png", width = 9, height = 6, units = "in", res = 300)
+draw(p)
+for(i in 1:k.gene) {
+    decorate_annotation("foo", slice = i, {
+        grid.rect(x = 0, width = unit(2, "mm"), 
+                  gp = gpar(fill = color[i], col = NA, fontsize = 10), just = "left")
+        grid.text(paste(text_list[[i]], collapse = "\n"), 
+                  x = unit(4, "mm"), just = "left")
+    })
+}
+dev.off()
+```
+#### Visualization of hierarchical clustering results for both samples and genes
+
+```{r}
+smpl.grp <- cutree(smpl.dend, k = k.smpl)
+fviz_cluster(list(data = mat, cluster = smpl.grp),
+             palette = "Set1",
+             geom = "point",
+             ellipse.type = "convex",
+             show.clust.cent = FALSE,
+             main = "Sample clusters",
+             ggtheme = theme_minimal())
+
+gene.grp <- cutree(gene.dend, k = k.gene)
+
+fviz_cluster(list(data = t(mat), cluster = gene.grp),
+             palette = "Set1",
+             geom = "point",
+             ellipse.type = "convex",
+             show.clust.cent = FALSE,
+             main = "Gene clusters",
+             ggtheme = theme_minimal())
+```
+
+#### Kruskal-Wallis Test is used for comparing two or more independent samples of equal or different sample sizes
+
+```{r warning=FALSE}
+mat_df <- as.data.frame(mat)
+mat_df$labels <- as.factor(smpl.grp)
+
+# Ensure that labels are factors with appropriate levels
+mat_df$labels <- factor(mat_df$labels, levels = c("1", "2", "3", "4"))
+
+# Select genes
+genes <- colnames(mat_df)
+
+# Perform Kruskal-Wallis test for each gene
+res <- sapply(genes, function(x) {
+  model <- kruskal.test(mat_df[[x]] ~ mat_df$labels)
+  p <- model$p.value
+  return(p)
+})
+
+# Set names for the result vector
+names(res) <- genes
+
+# Adjust p-values for multiple testing using Benjamini-Hochberg procedure
+adjusted_p <- p.adjust(res, method = "BH")
+
+# Define a significance threshold (e.g., 0.05)
+threshold <- 0.1
+
+# Identify significant genes for each label
+significant_genes <- list()
+for (label in levels(mat_df$labels)) {
+  sig_genes <- names(adjusted_p)[adjusted_p < threshold & mat_df$labels == label]
+  significant_genes[[paste("Label", label, sep = "_")]] <- sig_genes
+}
+```
+
+#### Retrieve detailed gene information from the Ensembl database for a set of genes identified as significant in a previous analysis
+
+#### Group 1
+```{r}
+symbols_1 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[1]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query <- symbols_1$ENTREZID
+
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+genes_info_1 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query, 
+                      mart = ensembl)
+
+head(genes_info_1)
+```
+```{r}
+ego1 <- enrichGO(gene = symbols_1$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.1) 
+
+png("~/TCGA_SKCM/dot_plot_7.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego1, showCategory = 20) 
+
+dev.off()
+```
+
+#### Group 2
+```{r}
+symbols_2 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[2]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query_2 <- symbols_2$ENTREZID
+
+
+genes_info_2 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query_2, 
+                      mart = ensembl)
+
+head(genes_info_2)
+```
+```{r}
+ego2 <- enrichGO(gene = symbols_2$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.1) 
+
+png("~/TCGA_SKCM/dot_plot_8.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego2, showCategory = 20) 
+
+dev.off()
+```
+
+#### Group 3
+```{r}
+symbols_3 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[3]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query_3 <- symbols_3$ENTREZID
+
+
+genes_info_3 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query_3, 
+                      mart = ensembl)
+
+head(genes_info_3)
+```
+```{r}
+ego3 <- enrichGO(gene = symbols_3$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.05) 
+
+png("~/TCGA_SKCM/dot_plot_9.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego3, showCategory = 20) 
+
+dev.off()
+```
+
+#### Group 4
+```{r}
+symbols_4 <- AnnotationDbi::select(org.Hs.eg.db,
+                                  keys = as.character(significant_genes[[4]]),
+                                  columns = c("SYMBOL"),
+                                  keytype = "ENTREZID") %>% na.omit()
+
+values_to_query_4 <- symbols_4$ENTREZID
+
+# Expand attributes to include functional information
+genes_info_4 <- getBM(attributes = c('gene_biotype', 'entrezgene_id', 'external_gene_name', 
+                                     'description'), 
+                      filters = 'entrezgene_id', 
+                      values = values_to_query_4, 
+                      mart = ensembl)
+
+# Check the first few rows to confirm it worked as expected
+head(genes_info_4)
+```
+```{r}
+ego4 <- enrichGO(gene = symbols_4$SYMBOL,
+                 OrgDb = org.Hs.eg.db,
+                 keyType = "SYMBOL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 qvalueCutoff = 0.05) 
+
+png("~/TCGA_SKCM/dot_plot_10.png", width = 1200, height = 800)
+
+clusterProfiler::dotplot(ego4, showCategory = 20) 
+
+dev.off()
+```
+# PART 2
+#### Upload correlation matrix from supplementary materials
+
+```{r}
+# Read the data
+correlation <- read_excel("~/TCGA_SKCM/correlation.xlsx")
+
+# Data type conversion and column selection
+correlation <- correlation %>%
+  mutate(
+    `Normal-like centroid` = as.numeric(`Normal-like centroid`),
+    `Proliferative centroid` = as.numeric(`Proliferative centroid`),
+    `Pigmentation centroid` = as.numeric(`Pigmentation centroid`),
+    `High-immune centroid` = as.numeric(`High-immune centroid`)
+  ) %>%
+  dplyr::select(-Probe, -ProbeID)
+
+
+head(correlation)
+
+# Select numeric correlation data
+numeric_correlation <- correlation %>%
+  dplyr::select(-SYMBOL)
+
+```
+
+#### Get the clusters from correlation matrix
+
+```{r}
+# Classify rows based on maximum value
+group <- apply(numeric_correlation, 1, which.max)
+
+# Assign descriptive labels
+group_labels <- c("normal_like", "proliferative", "pigmentation", "high_immune")
+
+named_closest_group <- group_labels[group]
+
+```
+
+```{r}
+# Merge
+merge_groups <- cbind(correlation, named_closest_group)
+```
+
+#### Upload the data and leave Hugo symbols
+
+```{r warning=FALSE}
+df_t_2 <- 
+  read_tsv("~/TCGA_SKCM/skcm_tcga/data_mrna_seq_v2_rsem.txt") %>%
+  dplyr::select(-Entrez_Gene_Id) %>%
+  dplyr::select(Hugo_Symbol, df_meta$SAMPLE_ID) %>%
+  distinct(Hugo_Symbol, .keep_all = TRUE) %>% na.omit()
+
+mat_2 <- t(df_t_2[-1])
+colnames(mat_2) <- df_t_2$Hugo_Symbol
+rownames(mat_2) <- colnames(df_t_2)[-1]
+
+mat <- log2(mat + 1)
+
+features <- 
+  apply(mat_2, 2, mad) %>%
+  sort(decreasing = T) %>%
+  .[1:3000] %>%
+  names()
+
+mat <- apply(mat, 2, function(x) (x - mean(x))/mad(x))
+
+mat_2 <- mat_2[, features]
+
+```
+#### Get 4 groups from all data
+
+```{r}
+# Split by names of groups
+list_of_merge_groups <- split(merge_groups, merge_groups$named_closest_group)
+```
+
+```{r}
+# Get Genes symbols
+mat_2 <- data.frame(mat_2)
+symbols <- colnames(mat_2)
+```
+
+#### Find intersection for all the groups
+#### high-immune
+
+```{r}
+high_immune <- intersect(list_of_merge_groups[[1]][[1]], symbols)
+high_immune
+```
+#### normal-like
+
+```{r}
+normal_like <- intersect(list_of_merge_groups[[2]][[1]], symbols)
+normal_like
+```
+#### pigmentation
+
+```{r}
+pigmentation <- intersect(list_of_merge_groups[[3]][[1]], symbols)
+pigmentation
+```
+#### proliferation
+
+```{r}
+proliferation <- intersect(list_of_merge_groups[[4]][[1]], symbols)
+proliferation
+```
+
+#### Given the results from gene information, heatmap, and Gene Ontology (GO) term analyses, the clusters have been categorized based on their presumed biological functions as follows: 1 - "normal_like", 2 - "pigmintation", 3 - "prolifirative", 4 - "high_immune")
+
+```{r}
+smpl.grp <- cutree(smpl.dend, k = k.smpl)
+smpl.grp <- case_when(smpl.grp == 1 ~ "normal_like",
+                 smpl.grp == 2 ~ "pigmintation",
+                 smpl.grp == 3 ~ "prolifirative",
+                 smpl.grp == 4 ~ "high_immune")
+
+df <- df_meta %>%
+  mutate(CLUSTER = as.factor(smpl.grp)) %>%
+  distinct(PATIENT_ID, .keep_all = T) %>%
+  filter(!is.na(DECEASED))
+  
+
+# Convert OS_MONTHS from months to weeks
+weeks = df$OS_MONTHS * 4.345
+
+# Cap the survival time at 100 weeks
+weeks_capped = pmin(weeks, 100)
+
+# Adjust the event indicator
+# Event is censored (0) if original time is greater than 100 weeks, regardless of original event status
+event_capped = ifelse(weeks > 100, 0, df$DECEASED)
+
+# Create the survival object with capped time and adjusted event
+surv_obj <- Surv(time = weeks_capped, event = event_capped)
+
+# Fit Kaplan-Meier survival curve
+km_fit <- survfit(surv_obj ~ df$CLUSTER)
+
+# Updated ggsurvplot call to display y-axis labels as percentages
+ggsurvplot(km_fit,
+           conf.int = FALSE,  # Do not show confidence interval
+           risk.table = FALSE,  # Do not add a table of the number of subjects at risk at each time point
+           xlab = "Time (weeks)",  # Customize X-axis label to indicate the time unit
+           ylab = "Survival Fraction",  # Customize Y-axis label
+           ggtheme = theme_minimal(),  # Use a minimal theme for the plot
+           data = df)
+```
+
+#### The clusters for the samples have been identified; however, their definitions are not precise, as each cluster contains genes from various groups
+
+# TASK 3
+#### Compare the resulting classifications. Which classification best separates patients by risk groups? Why do you think? Which classification is better? Which reflects tumor biology? Why? Which classification would you use for your work? and why? 
+#### Describe the result obtained. Were you able to reproduce the authors' results? Why?
+
+#### Conclusions
+#### 1. The classification provided corresponds to different subsets of samples. The first classification encompasses all stages of melanoma, whereas the second classification specifically focuses on samples from stage IV melanoma.
+#### 2. Based on the findings, the first classification demonstrates better segregation of patients into risk groups with higher survival of immune group. This is evidenced by the superior representation of specific genes and their associated Gene Ontology terms within this classification. Conversely, the second classification identifies four distinct groups, albeit predominantly observed across a subset of samples as depicted on the heatmap. It's possible that the clustering results are influenced by a small subset of samples in the second case. 
+#### 3. Classification 1 ("keratin", "MIFT-low", "immune") appears to focus more on molecular characteristics and pathways related to melanoma progression and immune response. It emphasizes factors such as keratin expression, MIFT activity, and immune system interactions, which are significant in understanding melanoma biology at the molecular level.
+#### 4. Classification 2 ("normal_like", "pigmentation", "proliferative", "high_immune") seems to categorize melanoma samples based on broader phenotypic features and clinical characteristics. 
+#### 5. If the focus is on molecular mechanisms and immune interactions, Classification 1 may be more suitable. On the other hand, if a broader phenotypic characterization is desired, Classification 2 could be more appropriate.
+#### 6. If my work were focused on understanding the molecular mechanisms and immune interactions underlying melanoma progression, I would likely choose Classification 1 ("keratin", "MIFT-low", "immune"). This classification provides insight into the molecular pathways involved in melanoma development and progression, as well as the interaction with the immune system. It offers a more focused and detailed perspective on the underlying biology of melanoma at the molecular level, which could be valuable for studying targeted therapies and immunotherapies.
+#### 7. I partially succeeded in reproducing the authors' results, likely because some procedures were not fully described in the articles. For example, in the first case, I selected the 1500 most variable genes by MAD. Moreover, I used MAD scaling, a method not described in the article. I encountered difficulty reproducing the average linkage clustering method described in the article. The second article utilized data from a different platform, necessitating the need to conduct clustering analysis anew using the available dataset. It might be worthwhile to consider repeating the procedures, starting with the counts using DESeq, to ensure consistency and accuracy in the analysis. 
+#### 8. Regarding the results of survival, I cannot provide any insights on the second classification due to the limited number of samples, but the first classification appears to be the most reliable. It's important to note that the second classification is specifically designed for stage IV melanoma.
+
+
